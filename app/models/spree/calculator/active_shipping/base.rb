@@ -1,5 +1,6 @@
-# This is a base calculator for shipping calcualations using the ActiveShipping plugin.  It is not intended to be
-# instantiated directly.  Create subclass for each specific shipping method you wish to support instead.
+# This is a base calculator for shipping calculations using the ActiveShipping plugin.
+# It is not intended to be instantiated directly. Create subclass for each specific
+# shipping method you wish to support instead.
 #
 # Digest::MD5 is used for cache_key generation.
 require 'digest/md5'
@@ -17,65 +18,35 @@ module Spree
         end
 
         def compute(object)
-          if object.is_a?(Array)
-            order = object.first.order
-          elsif object.is_a?(Shipment)
-            order = object.order
-          else
-            order = object
-          end
-          origin= Location.new(:country => Spree::ActiveShipping::Config[:origin_country],
-                               :city => Spree::ActiveShipping::Config[:origin_city],
-                               :state => Spree::ActiveShipping::Config[:origin_state],
-                               :zip => Spree::ActiveShipping::Config[:origin_zip])
+          order = retrieve_order(object)
 
+          origin = build_location_object
           addr = order.ship_address
+          destination = build_location_object(addr)
 
-          destination = Location.new(:country => addr.country.iso,
-                                     :state => (addr.state ? addr.state.abbr : addr.state_name),
-                                     :city => addr.city,
-                                     :zip => addr.zipcode)
-
-          rates_result = Rails.cache.fetch(cache_key(order)) do
-            order_packages = packages(order)
-            if order_packages.empty?
-              {}
-            else
-              retrieve_rates(origin, destination, order_packages)
-            end
+          order_packages = packages(order) 
+          rate_cost = if order_packages.empty?
+            {}
+          else
+            try_cached_rates(order, origin, destination, order_packages)
           end
 
-
-          raise rates_result if rates_result.kind_of?(Spree::ShippingError)
-          return nil if rates_result.empty?
-          rate = rates_result[self.class.description]
-
-          return nil unless rate
-          rate = rate.to_f + (Spree::ActiveShipping::Config[:handling_fee].to_f || 0.0)
-
-          # divide by 100 since active_shipping rates are expressed as cents
-          return rate/100.0
+          unless rate_cost.blank? 
+            rate = rate_cost.to_f + (Spree::ActiveShipping::Config[:handling_fee].to_f || 0.0)
+            # divide by 100 since active_shipping rates are expressed as cents
+            rate / 100.0
+          end
         end
 
+        def delivery_date(object)
+          order = retrieve_order(object)
 
-        def timing(line_items)
-          order = line_items.first.order
-          origin      = Location.new(:country => Spree::ActiveShipping::Config[:origin_country],
-                                     :city => Spree::ActiveShipping::Config[:origin_city],
-                                     :state => Spree::ActiveShipping::Config[:origin_state],
-                                     :zip => Spree::ActiveShipping::Config[:origin_zip])
+          origin = build_location_object
           addr = order.ship_address
-          destination = Location.new(:country => addr.country.iso,
-                                     :state => (addr.state ? addr.state.abbr : addr.state_name),
-                                     :city => addr.city,
-                                     :zip => addr.zipcode)
-          timings_result = Rails.cache.fetch(cache_key(order)+"-timings") do
-            retrieve_timings(origin, destination, packages(order))
-          end
-          raise timings_result if timings_result.kind_of?(Spree::ShippingError)
-          return nil if timings_result.nil? || !timings_result.is_a?(Hash) || timings_result.empty?
-          return timings_result[self.description]
+          destination = build_location_object(addr)
 
+          order_packages = packages(order) 
+          try_cached_rates(order, origin, destination, order_packages, "delivery_date")
         end
 
         protected
@@ -84,22 +55,20 @@ module Spree
           0
         end
 
+        def retrieve_order(object)
+          if object.is_a?(Array)
+            object.first.order
+          elsif object.is_a?(Shipment)
+            object.order
+          else
+            object
+          end
+        end
+
         private
         def retrieve_rates(origin, destination, packages)
           begin
-            response = carrier.find_rates(origin, destination, packages)
-            # turn this beastly array into a nice little hash
-            rates = response.rates.collect do |rate|
-              # decode html entities for xml-based APIs, ie Canada Post
-              if RUBY_VERSION.to_f < 1.9
-                service_name = Iconv.iconv('UTF-8//IGNORE', 'UTF-8', rate.service_name).first
-              else
-                service_name = rate.service_name.encode("UTF-8")
-              end
-              [CGI.unescapeHTML(service_name), rate.price]
-            end
-            rate_hash = Hash[*rates.flatten]
-            return rate_hash
+            carrier.find_rates(origin, destination, packages)
           rescue ActiveMerchant::ActiveMerchantError => e
 
             if [ActiveMerchant::ResponseError, ActiveMerchant::Shipping::ResponseError].include?(e.class) && e.response.is_a?(ActiveMerchant::Shipping::Response)
@@ -117,41 +86,37 @@ module Spree
             end
 
             error = Spree::ShippingError.new("#{I18n.t(:shipping_error)}: #{message}")
-            Rails.cache.write @cache_key, error #write error to cache to prevent constant re-lookups
+            Rails.cache.write @cache_key, error # write error to cache to prevent constant re-lookups
             raise error
           end
-
         end
 
+        def try_cached_rates(order, origin, destination, packages, rate_attribute = "price")
+          response = Rails.cache.fetch(cache_key(order)) do
+            retrieve_rates(origin, destination, packages)
+          end
 
-        def retrieve_timings(origin, destination, packages)
-          begin
-            if carrier.respond_to?(:find_time_in_transit)
-              response = carrier.find_time_in_transit(origin, destination, packages)
-              return response
-            end
-          rescue ActiveMerchant::Shipping::ResponseError => re
-            if re.response.is_a?(ActiveMerchant::Shipping::Response)
-              params = re.response.params
-              if params.has_key?("Response") && params["Response"].has_key?("Error") && params["Response"]["Error"].has_key?("ErrorDescription")
-                message = params["Response"]["Error"]["ErrorDescription"]
-              else
-                message = re.message
-              end
+          return response if response.is_a?(Spree::ShippingError)
+
+          rates = response.rates.collect do |rate|
+            # decode html entities for xml-based APIs, ie Canada Post
+            if RUBY_VERSION.to_f < 1.9
+              service_name = Iconv.iconv('UTF-8//IGNORE', 'UTF-8', rate.service_name).first
             else
-              message = re.message
+              service_name = rate.service_name.encode("UTF-8")
             end
-            
-            error = Spree::ShippingError.new("#{I18n.t(:shipping_error)}: #{message}")
-            Rails.cache.write @cache_key+"-timings", error #write error to cache to prevent constant re-lookups
-            raise error
+            [CGI.unescapeHTML(service_name), rate.send(rate_attribute)]
+          end
+
+          if rates.empty?
+            nil
+          else
+            rates_result = Hash[*rates.flatten]
+            rates_result[self.class.description]
           end
         end
 
-
-        
         private
-        
         def convert_order_to_weights_array(order)
           multiplier = Spree::ActiveShipping::Config[:unit_multiplier]
           default_weight = Spree::ActiveShipping::Config[:default_weight]
@@ -216,6 +181,20 @@ module Spree
           addr = order.ship_address
           line_items_hash = Digest::MD5.hexdigest(order.line_items.map {|li| li.variant_id.to_s + "_" + li.quantity.to_s }.join("|"))
           @cache_key = "#{carrier.name}-#{order.number}-#{addr.country.iso}-#{addr.state ? addr.state.abbr : addr.state_name}-#{addr.city}-#{addr.zipcode}-#{line_items_hash}-#{I18n.locale}".gsub(" ","")
+        end
+
+        def build_location_object(addr = nil)
+          if addr
+            Location.new(:country => addr.country.iso,
+                         :state => (addr.state ? addr.state.abbr : addr.state_name),
+                         :city => addr.city,
+                         :zip => addr.zipcode)
+          else
+            Location.new(:country => Spree::ActiveShipping::Config[:origin_country],
+                         :city => Spree::ActiveShipping::Config[:origin_city],
+                         :state => Spree::ActiveShipping::Config[:origin_state],
+                         :zip => Spree::ActiveShipping::Config[:origin_zip])
+          end
         end
       end
     end
