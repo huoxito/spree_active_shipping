@@ -96,7 +96,7 @@ module Spree
             retrieve_rates(origin, destination, packages)
           end
 
-          return response if response.is_a?(Spree::ShippingError)
+          raise response if response.is_a?(Spree::ShippingError)
 
           rates = response.rates.collect do |rate|
             # decode html entities for xml-based APIs, ie Canada Post
