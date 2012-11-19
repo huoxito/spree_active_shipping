@@ -21,8 +21,7 @@ module Spree
           order = retrieve_order(object)
 
           origin = build_location_object
-          addr = order.ship_address
-          destination = build_location_object(addr)
+          destination = build_location_object(order.ship_address)
 
           order_packages = packages(order) 
           rate_cost = if order_packages.empty?
@@ -42,8 +41,7 @@ module Spree
           order = retrieve_order(object)
 
           origin = build_location_object
-          addr = order.ship_address
-          destination = build_location_object(addr)
+          destination = build_location_object(order.ship_address)
 
           order_packages = packages(order) 
           try_cached_rates(order, origin, destination, order_packages, "delivery_date")
@@ -87,7 +85,7 @@ module Spree
 
             error = Spree::ShippingError.new("#{I18n.t(:shipping_error)}: #{message}")
             Rails.cache.write @cache_key, error # write error to cache to prevent constant re-lookups
-            raise error
+            error
           end
         end
 
@@ -96,7 +94,7 @@ module Spree
             retrieve_rates(origin, destination, packages)
           end
 
-          raise response if response.is_a?(Spree::ShippingError)
+          return nil if response.is_a?(Spree::ShippingError)
 
           rates = response.rates.collect do |rate|
             # decode html entities for xml-based APIs, ie Canada Post
